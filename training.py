@@ -17,6 +17,7 @@ from .dictionary import AutoEncoder
 from .evaluation import evaluate
 from .trainers.standard import StandardTrainer
 
+from torch import zeros
 
 def new_wandb_process(config, log_queue, entity, project):
     wandb.init(entity=entity, project=project, config=config, name=config["wandb_name"])
@@ -57,6 +58,7 @@ def log_stats(
                 residual_variance = t.var(act - act_hat, dim=0).sum()
                 frac_variance_explained = 1 - residual_variance / total_variance
                 log[f"frac_variance_explained"] = frac_variance_explained.item()
+                
             else:  # transcoder
                 x, x_hat, f, losslog = trainer.loss(act, step=step, logging=True)
 
@@ -73,34 +75,6 @@ def log_stats(
             if log_queues:
                 log_queues[i].put(log)
 
-def get_norm_factor(data, steps: int) -> float:
-    """Per Section 3.1, find a fixed scalar factor so activation vectors have unit mean squared norm.
-    This is very helpful for hyperparameter transfer between different layers and models.
-    Use more steps for more accurate results.
-    https://arxiv.org/pdf/2408.05147
-    
-    If experiencing troubles with hyperparameter transfer between models, it may be worth instead normalizing to the square root of d_model.
-    https://transformer-circuits.pub/2024/april-update/index.html#training-saes"""
-    total_mean_squared_norm = 0
-    count = 0
-
-    for step, act_BD in enumerate(tqdm(data, total=steps, desc="Calculating norm factor")):
-        if step > steps:
-            break
-
-        count += 1
-        mean_squared_norm = t.mean(t.sum(act_BD ** 2, dim=1))
-        total_mean_squared_norm += mean_squared_norm
-
-    average_mean_squared_norm = total_mean_squared_norm / count
-    norm_factor = t.sqrt(average_mean_squared_norm).item()
-
-    print(f"Average mean squared norm: {average_mean_squared_norm}")
-    print(f"Norm factor: {norm_factor}")
-    
-    return norm_factor
-
-
 
 def trainSAE(
     data,
@@ -111,20 +85,14 @@ def trainSAE(
     steps:Optional[int]=None,
     save_steps:Optional[list[int]]=None,
     save_dir:Optional[str]=None,
-    log_steps:Optional[int]=None,
+    log_steps:Optional[int]=None, #list of batch ids in which to log metrics
     activations_split_by_head:bool=False,
     transcoder:bool=False,
     run_cfg:dict={},
-    normalize_activations:bool=False,
 ):
     """
     Train SAEs using the given trainers
-
-    If normalize_activations is True, the activations will be normalized to have unit mean squared norm.
-    The autoencoders weights will be scaled before saving, so the activations don't need to be scaled during inference.
-    This is very helpful for hyperparameter transfer between different layers and models.
     """
-
     trainers = []
     for config in trainer_configs:
         trainer_class = config["trainer"]
@@ -164,21 +132,8 @@ def trainSAE(
     else:
         save_dirs = [None for _ in trainer_configs]
 
-    if normalize_activations:
-        norm_factor = get_norm_factor(data, steps=100)
-
-        for trainer in trainers:
-            trainer.config["norm_factor"] = norm_factor
-            # Verify that all autoencoders have a scale_biases method
-            trainer.ae.scale_biases(1.0)
-
+    #training loop
     for step, act in enumerate(tqdm(data, total=steps)):
-
-        act = act.to(dtype=t.float32)
-
-        if normalize_activations:
-            act /= norm_factor
-
         if steps is not None and step >= steps:
             break
 
@@ -192,11 +147,6 @@ def trainSAE(
         if save_steps is not None and step in save_steps:
             for dir, trainer in zip(save_dirs, trainers):
                 if dir is not None:
-
-                    if normalize_activations:
-                        # Temporarily scale up biases for checkpoint saving
-                        trainer.ae.scale_biases(norm_factor)
-
                     if not os.path.exists(os.path.join(dir, "checkpoints")):
                         os.mkdir(os.path.join(dir, "checkpoints"))
                     t.save(
@@ -204,17 +154,12 @@ def trainSAE(
                         os.path.join(dir, "checkpoints", f"ae_{step}.pt"),
                     )
 
-                    if normalize_activations:
-                        trainer.ae.scale_biases(1 / norm_factor)
-
         # training
         for trainer in trainers:
             trainer.update(step, act)
 
     # save final SAEs
     for save_dir, trainer in zip(save_dirs, trainers):
-        if normalize_activations:
-            trainer.ae.scale_biases(norm_factor)
         if save_dir is not None:
             t.save(trainer.ae.state_dict(), os.path.join(save_dir, "ae.pt"))
 
@@ -224,3 +169,5 @@ def trainSAE(
             queue.put("DONE")
         for process in wandb_processes:
             process.join()
+
+    return trainers
